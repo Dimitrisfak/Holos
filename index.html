@@ -1,6 +1,903 @@
 <!DOCTYPE html>
-<html>
-  <body>
-    <h1>coming soon</h1>
-  </body>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Holos — Life OS</title>
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Holos" />
+  <meta name="theme-color" content="#FAFAF8" />
+  <style>* { box-sizing: border-box; } body { margin: 0; background: #FAFAF8; }</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.8.0/Recharts.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+
+// ── localStorage helpers (replaces window.storage) ───────────────────────────
+const ls = {
+  get: (key) => { try { const v = localStorage.getItem(key); return v ? { value: v } : null; } catch { return null; } },
+  set: (key, val) => { try { localStorage.setItem(key, val); } catch {} },
+};
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2,9) + Date.now().toString(36);
+const todayStr = () => new Date().toISOString().split("T")[0];
+const fmtDate = (d) => new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"});
+const fmtDateFull = (d) => new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+const dateOffset = (days) => { const d=new Date(); d.setDate(d.getDate()+days); return d.toISOString().split("T")[0]; };
+const PALETTE = ["#D4622A","#2D6A4F","#2C5282","#744C9A","#B7791F","#C53030","#276749","#2B4C7E"];
+const TYPE_LABELS = { numeric:"Numeric", boolean:"Yes / No", consumption:"Consumption", categorical:"Categorical" };
+
+function pearson(xs,ys) {
+  const n=xs.length; if(n<3) return null;
+  const mx=xs.reduce((a,b)=>a+b)/n, my=ys.reduce((a,b)=>a+b)/n;
+  const num=xs.reduce((s,x,i)=>s+(x-mx)*(ys[i]-my),0);
+  const dx=Math.sqrt(xs.reduce((s,x)=>s+(x-mx)**2,0));
+  const dy=Math.sqrt(ys.reduce((s,y)=>s+(y-my)**2,0));
+  return dx&&dy?num/(dx*dy):null;
+}
+function computeStreak(logs,varId) {
+  const dates=[...new Set(logs.filter(l=>l.variableId===varId).map(l=>l.date))].sort().reverse();
+  if(!dates.length) return 0;
+  let streak=0; const dt=new Date(todayStr()+"T12:00:00");
+  for(const d of dates){ if(d===dt.toISOString().split("T")[0]){streak++;dt.setDate(dt.getDate()-1);}else break; }
+  return streak;
+}
+function rollingAvg(data,window) {
+  return data.map((pt,i)=>{ const s=data.slice(Math.max(0,i-window+1),i+1); return {...pt,rolling:parseFloat((s.reduce((a,p)=>a+p.value,0)/s.length).toFixed(2))}; });
+}
+function trendArrow(cur,prev) {
+  if(cur==null||prev==null) return {symbol:"→",color:"#888885"};
+  const p=((cur-prev)/Math.abs(prev||1))*100;
+  if(p>3) return {symbol:"↑",color:"#2D6A4F"};
+  if(p<-3) return {symbol:"↓",color:"#C53030"};
+  return {symbol:"→",color:"#888885"};
+}
+function gradeScore(pct) {
+  if(pct>=90) return {grade:"A+",color:"#2D6A4F"};
+  if(pct>=80) return {grade:"A",color:"#2D6A4F"};
+  if(pct>=70) return {grade:"B",color:"#276749"};
+  if(pct>=60) return {grade:"C",color:"#B7791F"};
+  if(pct>=40) return {grade:"D",color:"#D4622A"};
+  return {grade:"F",color:"#C53030"};
+}
+function goalMet(v,val) {
+  if(v.goal==null||val==null) return null;
+  if(["numeric","consumption"].includes(v.type)){ const n=parseFloat(val),g=parseFloat(v.goal); if(isNaN(n)) return null; return v.goalDir==="min"?n>=g:n<=g; }
+  if(v.type==="boolean") return v.goal==="yes"?(val===true||val==="true"):(val===false||val==="false");
+  if(v.type==="categorical"&&v.options) return v.options.indexOf(val)>=v.options.indexOf(v.goal);
+  return null;
+}
+function goalProgress(v,val) {
+  if(v.goal==null||val==null||!["numeric","consumption"].includes(v.type)) return null;
+  const n=parseFloat(val),g=parseFloat(v.goal);
+  if(isNaN(n)||isNaN(g)||g===0) return null;
+  return v.goalDir==="min"?Math.min(1,Math.max(0,n/g)):Math.min(1,Math.max(0,(2*g-n)/g));
+}
+
+// ── Default Variables ────────────────────────────────────────────────────────
+const DEFAULT_VARS = [
+  {id:"var-sleep",  name:"Sleep",       type:"numeric",     unit:"hrs", color:PALETTE[2],desc:"Hours of sleep",       goal:7,  goalDir:"min"},
+  {id:"var-workout",name:"Workout",     type:"boolean",     unit:"",   color:PALETTE[1],desc:"Did I work out?",       goal:"yes"},
+  {id:"var-water",  name:"Water",       type:"consumption", unit:"oz", color:PALETTE[0],desc:"Daily water intake",    goal:90, goalDir:"min"},
+  {id:"var-energy", name:"Energy",      type:"categorical", options:["Low","Medium","High","Very High"],color:PALETTE[3],desc:"Energy level",goal:"High"},
+  {id:"var-weight", name:"Body Weight", type:"numeric",     unit:"lbs",color:PALETTE[4],desc:"Morning weight",        goal:178,goalDir:"max"},
+  {id:"var-screen", name:"Screen Time", type:"consumption", unit:"hrs",color:PALETTE[7],desc:"Daily screen time",     goal:4,  goalDir:"max"},
+  {id:"var-mood",   name:"Mood",        type:"numeric",     unit:"/10",color:PALETTE[5],desc:"Daily mood score",      goal:7,  goalDir:"min"},
+  {id:"var-caffeine",name:"Caffeine",   type:"consumption", unit:"mg", color:PALETTE[6],desc:"Total caffeine intake", goal:250,goalDir:"max"},
+];
+
+// ── Seeded dummy data ────────────────────────────────────────────────────────
+function makeSeed(n){let s=(n+1)>>>0;return()=>{s=((s*1664525+1013904223)>>>0);return s/0xffffffff;};}
+function generateDummyLogs(variables){
+  const logs=[],clamp=(v,mn,mx)=>Math.min(mx,Math.max(mn,v));
+  for(let daysAgo=61;daysAgo>=0;daysAgo--){
+    const rng=makeSeed(daysAgo*997+42),rand=(mn,mx)=>rng()*(mx-mn)+mn;
+    const d=new Date();d.setDate(d.getDate()-daysAgo);
+    const date=d.toISOString().split("T")[0],ts=d.getTime();
+    const phase=daysAgo>42?0:daysAgo>21?0.5:1;
+    const sleep=parseFloat(clamp((6.1+phase*1.3)+rand(-1.2,1.2),4.5,9.0).toFixed(1));
+    const skipW=rng()>(0.38+phase*0.28),sleepQ=(sleep-6)/2.5;
+    const water=clamp(Math.round((55+phase*30+(skipW?0:20))+rand(-15,15)),30,120);
+    const energy=["Low","Medium","High","Very High"][clamp(Math.round(1.5+sleepQ*1.8+phase*0.5+rand(-0.4,0.4)),0,3)];
+    const weight=parseFloat(clamp((185.2-phase*5.5)+rand(-1.5,1.5),172,192).toFixed(1));
+    const screen=parseFloat(clamp((6.8-phase*1.8+(skipW?1.2:0))+rand(-0.8,0.8),1.5,9).toFixed(1));
+    const mood=parseFloat(clamp((5.5+phase*1.8+sleepQ*1.2+(!skipW?0.6:0))+rand(-0.8,0.8),1,10).toFixed(1));
+    const caffeine=clamp(Math.round((180+(sleep<6.5?80:0))+rand(-60,60)),50,400);
+    const entries={"var-sleep":{skip:rng()<0.05,value:sleep},"var-workout":{skip:rng()<0.06,value:!skipW},"var-water":{skip:rng()<0.10,value:water},"var-energy":{skip:rng()<0.08,value:energy},"var-weight":{skip:rng()<0.18,value:weight},"var-screen":{skip:rng()<0.12,value:screen},"var-mood":{skip:rng()<0.09,value:mood},"var-caffeine":{skip:rng()<0.14,value:caffeine}};
+    variables.forEach(v=>{const e=entries[v.id];if(!e||e.skip)return;logs.push({id:`demo-${v.id}-${daysAgo}`,variableId:v.id,value:e.value,date,ts});});
+  }
+  return logs;
+}
+
+// ── Design tokens ────────────────────────────────────────────────────────────
+const C={bg:"#FAFAF8",card:"#FFFFFF",border:"#E8E8E3",text:"#111110",muted:"#888885",faint:"#F4F4F0",accent:"#D4622A"};
+const S={
+  app:{fontFamily:"'Libre Baskerville',Georgia,serif",background:C.bg,minHeight:"100vh",color:C.text},
+  nav:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 24px",borderBottom:`1px solid ${C.border}`,background:C.bg,position:"sticky",top:0,zIndex:100,gap:12},
+  navTitle:{fontSize:16,fontWeight:700,letterSpacing:"-0.4px",whiteSpace:"nowrap"},
+  main:{maxWidth:960,margin:"0 auto",padding:"28px 18px 80px"},
+  tab:(a)=>({padding:"7px 14px",borderRadius:6,border:"none",cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:a?700:400,background:a?C.text:"transparent",color:a?C.bg:C.muted,transition:"all 0.18s",whiteSpace:"nowrap"}),
+  h2:{fontSize:24,fontWeight:700,margin:"0 0 5px",letterSpacing:"-0.6px"},
+  h3:{fontSize:11,fontWeight:700,margin:"0 0 14px",letterSpacing:"1px",textTransform:"uppercase",color:C.muted},
+  card:{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"20px 24px",marginBottom:14},
+  lcard:(color)=>({background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 20px",borderLeft:`3px solid ${color}`,marginBottom:12}),
+  grid:(n)=>({display:"grid",gridTemplateColumns:`repeat(${n},1fr)`,gap:12,marginBottom:14}),
+  input:{width:"100%",padding:"10px 14px",border:`1px solid ${C.border}`,borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box",background:C.faint,color:C.text},
+  select:{width:"100%",padding:"10px 14px",border:`1px solid ${C.border}`,borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box",background:C.faint,color:C.text},
+  btn:(v="primary",sm)=>({padding:sm?"6px 14px":"10px 22px",borderRadius:8,border:v==="outline"?`1px solid ${C.border}`:"none",cursor:"pointer",fontSize:sm?12:14,fontFamily:"inherit",fontWeight:600,background:v==="primary"?C.text:v==="danger"?"#C53030":v==="green"?"#2D6A4F":v==="accent"?C.accent:C.card,color:(v==="primary"||v==="danger"||v==="green"||v==="accent")?"#fff":C.text}),
+  badge:(color)=>({display:"inline-block",padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:700,background:color+"18",color}),
+  label:{display:"block",fontSize:11,fontWeight:700,marginBottom:6,color:C.muted,letterSpacing:"0.5px",textTransform:"uppercase"},
+  mono:{fontFamily:"'JetBrains Mono','Courier New',monospace"},
+  muted:{color:C.muted,fontSize:13},
+  divider:{border:"none",borderTop:`1px solid ${C.border}`,margin:"0"},
+};
+
+const UNIT_GROUPS={
+  "Time":["hrs","min","sec"],"Weight":["lbs","kg","g","oz"],"Volume":["oz","ml","L","cups","tbsp","tsp","fl oz","gal"],
+  "Distance":["mi","km","m","ft","steps"],"Energy":["kcal","kJ"],"Substances":["mg","mcg","g","IU","shots","drinks","cigarettes","servings"],
+  "Score":["/10","/5","/100"],"Money":["$","€","£"],"Count":["times","reps","sets","pages","tasks","pills"],"Other":["°F","°C","mmHg","bpm","custom..."],
+};
+const ALL_PRESET_UNITS=Object.values(UNIT_GROUPS).flat();
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function Modal({title,onClose,children,width}){
+  useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
+  return(
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.35)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:C.card,borderRadius:16,padding:28,width:"100%",maxWidth:width||520,maxHeight:"90vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.18)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+          <span style={{fontSize:17,fontWeight:700}}>{title}</span>
+          <button onClick={onClose} style={{background:"none",border:"none",fontSize:24,cursor:"pointer",color:C.muted,lineHeight:1,padding:0}}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ── Var Form ──────────────────────────────────────────────────────────────────
+function VarForm({initial,onSave,onClose,isEdit}){
+  const [form,setForm]=useState(()=>{
+    if(initial) return {name:initial.name||"",type:initial.type||"numeric",unit:initial.unit||"",options:initial.options?initial.options.join(", "):"",color:initial.color||PALETTE[0],desc:initial.desc||"",goal:initial.goal!=null?String(initial.goal):"",goalDir:initial.goalDir||"min"};
+    return {name:"",type:"numeric",unit:"",options:"",color:PALETTE[0],desc:"",goal:"",goalDir:"min"};
+  });
+  const upd=(k,v)=>setForm(f=>({...f,[k]:v}));
+  function save(){
+    if(!form.name.trim()) return;
+    const goal=form.goal.trim()!==""?(form.type==="numeric"||form.type==="consumption"?parseFloat(form.goal):form.goal.trim()):null;
+    onSave({id:initial?.id||uid(),name:form.name.trim(),type:form.type,unit:form.unit.trim(),color:form.color,desc:form.desc.trim(),options:form.type==="categorical"?form.options.split(",").map(s=>s.trim()).filter(Boolean):(initial?.options||[]),goal,goalDir:form.goalDir});
+    onClose();
+  }
+  const isCustomUnit=form.unit!==""&&!ALL_PRESET_UNITS.includes(form.unit)&&form.unit!=="custom...";
+  const showUnitCustomInput=form.unit==="custom..."||isCustomUnit;
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <div><label style={S.label}>Variable Name</label><input style={S.input} placeholder="e.g. Body Weight, Caffeine..." value={form.name} onChange={e=>upd("name",e.target.value)} autoFocus /></div>
+      {!isEdit&&<div><label style={S.label}>Type</label><select style={S.select} value={form.type} onChange={e=>upd("type",e.target.value)}>{Object.entries(TYPE_LABELS).map(([k,v])=><option key={k} value={k}>{v}</option>)}</select></div>}
+      {(form.type==="numeric"||form.type==="consumption")&&<div><label style={S.label}>Unit</label><select style={S.select} value={isCustomUnit?"custom...":form.unit} onChange={e=>{if(e.target.value==="custom...")upd("unit","custom...");else upd("unit",e.target.value);}}><option value="">Select a unit...</option>{Object.entries(UNIT_GROUPS).map(([group,units])=><optgroup key={group} label={group}>{units.map(u=><option key={u} value={u}>{u}</option>)}</optgroup>)}</select>{showUnitCustomInput&&<input style={{...S.input,marginTop:8}} placeholder="Type custom unit..." value={isCustomUnit?form.unit:""} onChange={e=>upd("unit",e.target.value)} />}</div>}
+      {form.type==="categorical"&&<div><label style={S.label}>Options (comma-separated)</label><input style={S.input} placeholder="Low, Medium, High, Very High" value={form.options} onChange={e=>upd("options",e.target.value)} /></div>}
+      <div style={{display:"grid",gridTemplateColumns:(form.type==="numeric"||form.type==="consumption")?"1fr 120px":"1fr",gap:10}}>
+        <div>
+          <label style={S.label}>Goal (optional)</label>
+          {(form.type==="numeric"||form.type==="consumption")&&<input style={S.input} type="number" placeholder="e.g. 7" value={form.goal} onChange={e=>upd("goal",e.target.value)} step="any" />}
+          {form.type==="boolean"&&<select style={S.select} value={form.goal} onChange={e=>upd("goal",e.target.value)}><option value="">No goal</option><option value="yes">Should be Yes</option><option value="no">Should be No</option></select>}
+          {form.type==="categorical"&&(()=>{const opts=form.options.split(",").map(s=>s.trim()).filter(Boolean);if(!opts.length)return null;return<select style={S.select} value={form.goal} onChange={e=>upd("goal",e.target.value)}><option value="">No goal</option>{opts.map(o=><option key={o} value={o}>Reach: {o}</option>)}</select>;})()}
+        </div>
+        {(form.type==="numeric"||form.type==="consumption")&&form.goal!==""&&<div><label style={S.label}>Direction</label><select style={S.select} value={form.goalDir} onChange={e=>upd("goalDir",e.target.value)}><option value="min">≥ At least</option><option value="max">≤ At most</option></select></div>}
+      </div>
+      <div><label style={S.label}>Color</label><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{PALETTE.map(c=><div key={c} onClick={()=>upd("color",c)} style={{width:28,height:28,borderRadius:"50%",background:c,cursor:"pointer",border:form.color===c?"3px solid #111":"2px solid transparent"}} />)}</div></div>
+      <div><label style={S.label}>Description (optional)</label><input style={S.input} placeholder="What does this track?" value={form.desc} onChange={e=>upd("desc",e.target.value)} /></div>
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:4}}>
+        <button style={S.btn("outline")} onClick={onClose}>Cancel</button>
+        <button style={S.btn()} onClick={save}>{isEdit?"Save Changes":"Save Variable"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Value Input ───────────────────────────────────────────────────────────────
+function isSliderVar(v){const u=(v.unit||"").trim();return u==="/10"||u==="/5"||u==="/100";}
+function SliderInput({variable:v,value,onChange}){
+  const u=(v.unit||"").trim();
+  const max=u.includes("5")&&!u.includes("100")?5:u.includes("100")?100:10;
+  const current=value!=null&&value!==""?parseFloat(value):null;
+  const pct=current!=null?((current-1)/(max-1))*100:0;
+  const ticks=Array.from({length:max},(_,i)=>i+1);
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <span style={{...S.mono,fontSize:28,fontWeight:700,color:current!=null?v.color:"#CCC",minWidth:36}}>{current!=null?current:"—"}</span>
+        <span style={S.muted}>out of {max}</span>
+      </div>
+      <style>{`.lt-sl-${v.id}{-webkit-appearance:none;appearance:none;width:100%;height:5px;border-radius:3px;outline:none;cursor:pointer;background:linear-gradient(to right,${v.color} 0%,${v.color} ${pct}%,#E8E8E3 ${pct}%,#E8E8E3 100%)}.lt-sl-${v.id}::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:${v.color};border:2px solid white;box-shadow:0 1px 6px rgba(0,0,0,0.2);cursor:pointer}.lt-sl-${v.id}::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:${v.color};border:2px solid white;cursor:pointer}`}</style>
+      <input type="range" className={`lt-sl-${v.id}`} min={1} max={max} step={1} value={current??Math.ceil(max/2)} onChange={e=>onChange(parseInt(e.target.value))} onMouseDown={e=>{if(current==null)onChange(parseInt(e.currentTarget.value));}} />
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>{ticks.filter((_,i)=>max<=10?true:(i%10===0||i===max-1)).map(n=><span key={n} style={{fontSize:9,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>{n}</span>)}</div>
+      {current!=null&&<button onClick={()=>onChange(null)} style={{marginTop:6,background:"none",border:"none",fontSize:11,color:C.muted,cursor:"pointer",padding:0,fontFamily:"inherit"}}>✕ clear</button>}
+    </div>
+  );
+}
+function ValueInput({variable:v,value,onChange}){
+  const {type,unit,options}=v;
+  if(type==="boolean") return <div style={{display:"flex",gap:8}}><button onClick={()=>onChange(value===true?null:true)} style={{...S.btn(value===true?"green":"outline"),flex:1}}>✓ Yes</button><button onClick={()=>onChange(value===false?null:false)} style={{...S.btn(value===false?"danger":"outline"),flex:1}}>✗ No</button></div>;
+  if(type==="categorical") return <select style={S.select} value={value||""} onChange={e=>onChange(e.target.value||null)}><option value="">Select...</option>{(options||[]).map(o=><option key={o} value={o}>{o}</option>)}</select>;
+  if(isSliderVar(v)) return <SliderInput variable={v} value={value} onChange={onChange} />;
+  return <div style={{display:"flex",gap:10,alignItems:"center"}}><input type="number" style={{...S.input,flex:1}} placeholder="Enter value..." value={value??""} onChange={e=>onChange(e.target.value===""?null:e.target.value)} step="any" min="0" />{unit&&<span style={{...S.muted,whiteSpace:"nowrap",fontWeight:600}}>{unit}</span>}</div>;
+}
+
+// ── Heatmap Calendar ──────────────────────────────────────────────────────────
+function HeatmapCalendar({variable:v,logs}){
+  const WEEKS=26;
+  const today=new Date(todayStr()+"T12:00:00"),dow=today.getDay(),totalDays=WEEKS*7;
+  const startDate=new Date(today);startDate.setDate(startDate.getDate()-(totalDays-1+dow));
+  const [hovered,setHovered]=useState(null);
+  const logMap=useMemo(()=>{const m={};logs.filter(l=>l.variableId===v.id).forEach(l=>{if(!m[l.date]||l.ts>m[l.date].ts)m[l.date]=l;});return m;},[logs,v.id]);
+  const allVals=useMemo(()=>logs.filter(l=>l.variableId===v.id&&["numeric","consumption"].includes(v.type)).map(l=>Number(l.value)),[logs,v]);
+  const numMax=allVals.length?Math.max(...allVals):1,numMin=allVals.length?Math.min(...allVals):0;
+  function intensity(date){
+    const l=logMap[date];if(!l) return 0;
+    if(v.type==="boolean") return l.value===true||l.value==="true"?4:1;
+    if(v.type==="categorical"){const idx=v.options?v.options.indexOf(l.value):0,len=v.options?v.options.length-1:1;return Math.round((idx/(len||1))*3)+1;}
+    const val=Number(l.value);if(numMax===numMin)return 3;return Math.round(((val-numMin)/(numMax-numMin))*3)+1;
+  }
+  const hexA=(hex,a)=>{const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);return `rgba(${r},${g},${b},${a})`;};
+  const colorMap=[C.faint,hexA(v.color,0.2),hexA(v.color,0.45),hexA(v.color,0.7),v.color];
+  const grid=useMemo(()=>{const cells=[],cur=new Date(startDate),todayISO=todayStr();for(let i=0;i<totalDays;i++){const ds=cur.toISOString().split("T")[0];cells.push(ds<=todayISO?ds:null);cur.setDate(cur.getDate()+1);}const weeks=[];for(let w=0;w<WEEKS;w++)weeks.push(cells.slice(w*7,w*7+7));return weeks;},[]);
+  const monthLabels=useMemo(()=>{const labels=[];let lastMonth=-1;grid.forEach((week,wi)=>{const d=week[0];if(d){const m=new Date(d+"T12:00:00").getMonth();if(m!==lastMonth){labels.push({wi,label:new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short"})});lastMonth=m;}}});return labels;},[grid]);
+  return(
+    <div style={{overflowX:"auto",paddingBottom:4}}>
+      <div style={{display:"inline-block",minWidth:WEEKS*14+50}}>
+        <div style={{display:"flex",paddingLeft:26,marginBottom:2}}>{grid.map((_,wi)=>{const mo=monthLabels.find(m=>m.wi===wi);return <div key={wi} style={{width:14,fontSize:9,color:C.muted,flexShrink:0}}>{mo?mo.label:""}</div>;})}</div>
+        <div style={{display:"flex"}}>
+          <div style={{display:"flex",flexDirection:"column",marginRight:4}}>{["Su","Mo","Tu","We","Th","Fr","Sa"].map((d,i)=><div key={i} style={{height:13,fontSize:8,color:C.muted,lineHeight:"13px",width:22,textAlign:"right",paddingRight:3,marginBottom:1}}>{i%2===1?d:""}</div>)}</div>
+          {grid.map((week,wi)=>(
+            <div key={wi} style={{display:"flex",flexDirection:"column"}}>
+              {week.map((date,di)=>{
+                const val=date?intensity(date):-1,log=date?logMap[date]:null;
+                return <div key={di} style={{width:12,height:12,borderRadius:2,margin:1,background:date===null?"transparent":colorMap[val],cursor:date?"pointer":"default",flexShrink:0,opacity:date===null?0.1:1}} onMouseEnter={()=>date&&setHovered({date,log})} onMouseLeave={()=>setHovered(null)} />;
+              })}
+            </div>
+          ))}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:5,marginTop:8,paddingLeft:26}}>
+          <span style={{fontSize:9,color:C.muted}}>Less</span>{[0,1,2,3,4].map(i=><div key={i} style={{width:10,height:10,borderRadius:2,background:colorMap[i]}}/>)}<span style={{fontSize:9,color:C.muted}}>More</span>
+        </div>
+      </div>
+      {hovered&&<div style={{position:"fixed",bottom:20,left:"50%",transform:"translateX(-50%)",background:C.text,color:C.bg,padding:"7px 14px",borderRadius:7,fontSize:12,fontFamily:"inherit",fontWeight:600,whiteSpace:"nowrap",zIndex:9999,pointerEvents:"none"}}>{fmtDateFull(hovered.date)} — {hovered.log?(v.type==="boolean"?(hovered.log.value===true||hovered.log.value==="true"?"✓ Yes":"✗ No"):`${hovered.log.value}${v.unit?" "+v.unit:""}`):"No data"}</div>}
+    </div>
+  );
+}
+
+// ── Conditional Correlation ───────────────────────────────────────────────────
+function ConditionalCorrelation({variables,logs}){
+  const numericVars=variables.filter(v=>["numeric","consumption","boolean"].includes(v.type));
+  const [condVar,setCondVar]=useState(numericVars[0]?.id||"");
+  const [outcomeVar,setOutcomeVar]=useState(numericVars[1]?.id||"");
+  const [threshold,setThreshold]=useState("");
+  const [dir,setDir]=useState("gte");
+  const [autoFilled,setAutoFilled]=useState(false);
+  useEffect(()=>{const cv=variables.find(v=>v.id===condVar);if(cv&&cv.goal!=null&&["numeric","consumption"].includes(cv.type)){setThreshold(String(cv.goal));setDir(cv.goalDir==="min"?"gte":"lt");setAutoFilled(true);}else if(autoFilled){setThreshold("");setAutoFilled(false);}},[condVar,variables]);
+  const result=useMemo(()=>{
+    if(!condVar||!outcomeVar||condVar===outcomeVar) return null;
+    const cv=variables.find(v=>v.id===condVar),ov=variables.find(v=>v.id===outcomeVar);if(!cv||!ov) return null;
+    const condMap=new Map(logs.filter(l=>l.variableId===condVar).map(l=>[l.date,Number(l.value)]));
+    const outMap=new Map(logs.filter(l=>l.variableId===outcomeVar).map(l=>[l.date,Number(l.value)]));
+    const shared=[...condMap.keys()].filter(d=>outMap.has(d));if(!shared.length) return null;
+    const thresh=threshold!==""?parseFloat(threshold):null;
+    let inGroup=[],outGroup=[];
+    shared.forEach(d=>{const cv_v=condMap.get(d),ov_v=outMap.get(d);if(thresh===null){inGroup.push(ov_v);}else{(dir==="gte"?cv_v>=thresh:cv_v<thresh)?inGroup.push(ov_v):outGroup.push(ov_v);}});
+    const avg=arr=>arr.length?arr.reduce((a,b)=>a+b)/arr.length:null;
+    const r=pearson(shared.map(d=>condMap.get(d)),shared.map(d=>outMap.get(d)));
+    return {cv,ov,thresh,dir,avgIn:avg(inGroup),avgOut:avg(outGroup),inN:inGroup.length,outN:outGroup.length,r,total:shared.length};
+  },[condVar,outcomeVar,threshold,dir,logs,variables]);
+  if(numericVars.length<2) return <div style={{...S.card,...S.muted}}>Need at least 2 numeric/boolean variables.</div>;
+  return(
+    <div style={S.card}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 76px 1fr",gap:10,marginBottom:14,alignItems:"end"}}>
+        <div><label style={S.label}>When this variable...</label><select style={S.select} value={condVar} onChange={e=>setCondVar(e.target.value)}>{numericVars.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></div>
+        <div><label style={S.label}>Is</label><select style={S.select} value={dir} onChange={e=>setDir(e.target.value)}><option value="gte">≥</option><option value="lt">&lt;</option></select></div>
+        <div><label style={S.label}>Threshold</label><input style={S.input} type="number" placeholder="e.g. 7" value={threshold} onChange={e=>{setThreshold(e.target.value);setAutoFilled(false);}} step="any" />{autoFilled&&<span style={{fontSize:10,color:"#2D6A4F",fontWeight:600,marginTop:3,display:"block"}}>🎯 Auto-filled from goal</span>}</div>
+      </div>
+      <div style={{marginBottom:16}}><label style={S.label}>...how does this outcome look?</label><select style={S.select} value={outcomeVar} onChange={e=>setOutcomeVar(e.target.value)}>{numericVars.filter(v=>v.id!==condVar).map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></div>
+      {result&&<>
+        <hr style={{...S.divider,marginBottom:16}}/>
+        <div style={{background:C.faint,borderRadius:10,padding:"14px 18px",marginBottom:16}}>
+          {result.thresh!==null&&result.avgIn!==null&&result.avgOut!==null?(
+            <p style={{margin:0,fontSize:15,lineHeight:1.65}}>
+              On days when <strong style={{color:result.cv.color}}>{result.cv.name}</strong> {result.dir==="gte"?"≥":"<"} <strong>{result.thresh}</strong>{result.cv.unit?" "+result.cv.unit:""},{" "}
+              <strong style={{color:result.ov.color}}>{result.ov.name}</strong> averages{" "}
+              <strong style={S.mono}>{result.avgIn.toFixed(2)}{result.ov.unit?" "+result.ov.unit:""}</strong> <span style={S.muted}>({result.inN}d)</span>
+              {" "}vs <strong style={S.mono}>{result.avgOut.toFixed(2)}{result.ov.unit?" "+result.ov.unit:""}</strong> <span style={S.muted}>otherwise ({result.outN}d)</span>
+              {result.avgOut!==0&&<span style={{color:result.avgIn>result.avgOut?"#2D6A4F":"#C53030",fontWeight:700}}>{" "}— {Math.abs(((result.avgIn-result.avgOut)/Math.abs(result.avgOut||1))*100).toFixed(0)}% {result.avgIn>result.avgOut?"higher":"lower"}.</span>}
+            </p>
+          ):<p style={{margin:0,...S.muted}}>Set a threshold above to compare two groups.</p>}
+        </div>
+        <div style={S.grid(3)}>
+          {[["Overall r",result.r!==null?(result.r>0?"+":"")+result.r.toFixed(3):"—"],["Shared Days",result.total+"d"],["Strength",result.r!==null?(Math.abs(result.r)>0.7?"Strong":Math.abs(result.r)>0.4?"Moderate":Math.abs(result.r)>0.2?"Weak":"Negligible"):"—"]].map(([label,val])=>(
+            <div key={label} style={{background:C.faint,borderRadius:8,padding:"12px 14px"}}><div style={{...S.muted,fontSize:11,marginBottom:4}}>{label}</div><div style={{...S.mono,fontWeight:700,fontSize:17}}>{val}</div></div>
+          ))}
+        </div>
+      </>}
+    </div>
+  );
+}
+
+// ── Rolling Chart ─────────────────────────────────────────────────────────────
+function RollingChart({variable:v,logs}){
+  const [win,setWin]=useState(7);
+  const series=useMemo(()=>{
+    const cutoff=Date.now()-90*86400000;
+    const pts=logs.filter(l=>l.variableId===v.id&&new Date(l.date+"T12:00:00").getTime()>=cutoff).sort((a,b)=>a.date.localeCompare(b.date)).map(l=>({date:fmtDate(l.date),value:v.type==="boolean"?(l.value===true||l.value==="true"?1:0):v.type==="categorical"?(v.options?v.options.indexOf(l.value)+1:0):Number(l.value)}));
+    return rollingAvg(pts,win);
+  },[logs,v,win]);
+  const recent=series.slice(-win),prev=series.slice(-win*2,-win);
+  const avgR=recent.length?recent.reduce((s,p)=>s+p.value,0)/recent.length:null;
+  const avgP=prev.length?prev.reduce((s,p)=>s+p.value,0)/prev.length:null;
+  const arrow=trendArrow(avgR,avgP);
+  if(series.length<2) return <div style={{...S.muted,padding:"10px 0"}}>Log at least 2 entries to see a trend.</div>;
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+          <span style={{...S.mono,fontSize:20,fontWeight:700}}>{avgR?.toFixed(1)}{v.unit?" "+v.unit:""}</span>
+          <span style={{fontSize:20,color:arrow.color,fontWeight:700}}>{arrow.symbol}</span>
+          <span style={S.muted}>{win}d avg</span>
+        </div>
+        <div style={{display:"flex",gap:5}}>{[7,30].map(w=><button key={w} onClick={()=>setWin(w)} style={{...S.tab(win===w),padding:"5px 12px",fontSize:12}}>Rolling {w}d</button>)}</div>
+      </div>
+      <ResponsiveContainer width="100%" height={190}>
+        <LineChart data={series} margin={{top:4,right:6,bottom:4,left:0}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#F0F0EB" />
+          <XAxis dataKey="date" tick={{fontSize:10,fontFamily:"inherit"}} />
+          <YAxis tick={{fontSize:10,fontFamily:"JetBrains Mono,monospace"}} />
+          <Tooltip contentStyle={{fontFamily:"inherit",fontSize:12,borderRadius:8,border:`1px solid ${C.border}`}} formatter={(val,name)=>[`${val}${v.unit?" "+v.unit:""}`,name==="rolling"?`${win}d avg`:"Daily"]} />
+          <Line type="monotone" dataKey="value" stroke={v.color+"55"} strokeWidth={1.5} dot={false} name="Daily" />
+          <Line type="monotone" dataKey="rolling" stroke={v.color} strokeWidth={2.5} dot={false} name="rolling" strokeDasharray={win===30?"5 2":undefined} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ── Weekly Report Card ────────────────────────────────────────────────────────
+function WeeklyReportCard({variables,logs}){
+  const [weekOffset,setWeekOffset]=useState(0);
+  const {weekStart,weekDates,report}=useMemo(()=>{
+    const today=new Date(todayStr()+"T12:00:00"),dow=today.getDay();
+    const ws=new Date(today);ws.setDate(today.getDate()-dow+weekOffset*7);
+    const todayISO=todayStr(),weekDates=[],cur=new Date(ws);
+    const we=new Date(ws);we.setDate(ws.getDate()+6);
+    while(cur<=we&&cur.toISOString().split("T")[0]<=todayISO){weekDates.push(cur.toISOString().split("T")[0]);cur.setDate(cur.getDate()+1);}
+    const report=variables.map(v=>{
+      const wl=logs.filter(l=>l.variableId===v.id&&weekDates.includes(l.date));
+      const loggedDays=[...new Set(wl.map(l=>l.date))].length;
+      const consistency=weekDates.length?(loggedDays/weekDates.length)*100:0;
+      let score=consistency,detail=`${loggedDays}/${weekDates.length} days logged`;
+      if(v.type==="boolean"&&wl.length){const yes=wl.filter(l=>l.value===true||l.value==="true").length;score=(consistency*0.4)+((yes/wl.length)*100*0.6);detail=`${yes}/${wl.length} logged days = Yes`;}
+      else if(["numeric","consumption"].includes(v.type)&&wl.length>=2){
+        const priorStart=new Date(ws);priorStart.setDate(priorStart.getDate()-28);
+        const prior=logs.filter(l=>l.variableId===v.id&&l.date>=priorStart.toISOString().split("T")[0]&&!weekDates.includes(l.date));
+        const wAvg=wl.reduce((s,l)=>s+Number(l.value),0)/wl.length;
+        if(prior.length){const pAvg=prior.reduce((s,l)=>s+Number(l.value),0)/prior.length;const imp=pAvg?Math.min(100,Math.max(0,50+(((wAvg-pAvg)/Math.abs(pAvg))*50))):50;score=consistency*0.5+imp*0.5;}
+        detail=`Avg ${wAvg.toFixed(1)} ${v.unit} this week`;
+      }
+      const {grade,color}=gradeScore(score);
+      return {variable:v,grade,color,score,detail,loggedDays,totalDays:weekDates.length};
+    });
+    return {weekStart:ws.toISOString().split("T")[0],weekDates,report};
+  },[variables,logs,weekOffset]);
+  const {grade:ogGrade,color:ogColor}=gradeScore(report.length?report.reduce((s,r)=>s+r.score,0)/report.length:0);
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18,flexWrap:"wrap",gap:8}}>
+        <div style={S.h3}>Week of {fmtDate(weekStart)}</div>
+        <div style={{display:"flex",gap:6}}><button style={S.btn("outline",true)} onClick={()=>setWeekOffset(o=>o-1)}>← Prev</button>{weekOffset<0&&<button style={S.btn("outline",true)} onClick={()=>setWeekOffset(o=>Math.min(0,o+1))}>Next →</button>}</div>
+      </div>
+      {report.map(r=>{
+        const ws=new Date(weekStart+"T12:00:00"),todayISO=todayStr();
+        return(
+          <div key={r.variable.id} style={{...S.lcard(r.variable.color),display:"flex",alignItems:"center",gap:12}}>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:8,flexWrap:"wrap"}}><span style={{fontWeight:700,fontSize:14}}>{r.variable.name}</span><span style={{...S.muted,fontSize:12}}>{r.detail}</span></div>
+              <div style={{display:"flex",gap:3}}>{[0,1,2,3,4,5,6].map(d=>{const day=new Date(ws);day.setDate(ws.getDate()+d);const ds=day.toISOString().split("T")[0],future=ds>todayISO,logged=logs.some(l=>l.variableId===r.variable.id&&l.date===ds);return <div key={d} style={{width:24,height:24,borderRadius:4,background:future?"transparent":logged?r.variable.color+"25":C.faint,border:future?`1px dashed ${C.border}`:`1.5px solid ${logged?r.variable.color:C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:logged?r.variable.color:C.muted,fontWeight:700}}>{!future&&(logged?"✓":"")}</div>;})}
+              </div>
+            </div>
+            <span style={{...S.mono,fontSize:30,fontWeight:700,color:r.color,minWidth:46,textAlign:"center"}}>{r.grade}</span>
+          </div>
+        );
+      })}
+      <div style={{background:C.faint,borderRadius:12,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6}}>
+        <div><div style={{fontWeight:700,fontSize:15}}>Overall GPA</div><div style={S.muted}>{report.length} variable{report.length!==1?"s":""} tracked</div></div>
+        <span style={{...S.mono,fontSize:36,fontWeight:700,color:ogColor}}>{ogGrade}</span>
+      </div>
+    </div>
+  );
+}
+
+// ── History Tab ───────────────────────────────────────────────────────────────
+function HistoryTab({variables,logs,setLogs,notify,getTodayDisplay}){
+  const [selectedDate,setSelectedDate]=useState(null);
+  const [editValues,setEditValues]=useState({});
+  const [editing,setEditing]=useState(false);
+  const byDate=useMemo(()=>{const map={};logs.forEach(l=>{if(!map[l.date])map[l.date]=[];map[l.date].push(l);});return Object.entries(map).sort((a,b)=>b[0].localeCompare(a[0]));},[logs]);
+  const byMonth=useMemo(()=>{const months={};byDate.forEach(([date])=>{const key=date.slice(0,7);if(!months[key])months[key]=[];months[key].push(date);});return Object.entries(months).sort((a,b)=>b[0].localeCompare(a[0]));},[byDate]);
+  const [openMonths,setOpenMonths]=useState({});
+  const [initialized,setInitialized]=useState(false);
+  useEffect(()=>{if(!initialized&&byMonth.length){setOpenMonths({[byMonth[0][0]]:true});setInitialized(true);}},[byMonth,initialized]);
+  const toggleMonth=key=>setOpenMonths(m=>({...m,[key]:!m[key]}));
+  const dayLogs=useMemo(()=>selectedDate?logs.filter(l=>l.variableId&&l.date===selectedDate):[],[logs,selectedDate]);
+  function openDay(date){setSelectedDate(date);setEditing(false);setEditValues({});}
+  function startEdit(){const vals={};dayLogs.forEach(l=>{vals[l.variableId]=l.value;});setEditValues(vals);setEditing(true);}
+  function saveEdit(){
+    const entries=Object.entries(editValues).filter(([,v])=>v!==""&&v!==undefined&&v!==null);
+    const ids=entries.map(([id])=>id);
+    const others=logs.filter(l=>!(l.date===selectedDate&&ids.includes(l.variableId)));
+    const updated=entries.map(([varId,value])=>({id:`edit-${varId}-${selectedDate}-${Date.now()}`,variableId:varId,value,date:selectedDate,ts:Date.now()}));
+    setLogs([...others,...updated]);setEditing(false);notify("✓ Entry updated");
+  }
+  function deleteDay(){if(!window.confirm(`Delete all logs for ${fmtDateFull(selectedDate)}?`))return;setLogs(ls=>ls.filter(l=>l.date!==selectedDate));setSelectedDate(null);notify("Deleted day's logs");}
+  const fmtMonthKey=key=>new Date(key+"-15").toLocaleDateString("en-US",{month:"long",year:"numeric"});
+  const fmtDayHeader=date=>new Date(date+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+  const fmtDayShort=date=>{const d=new Date(date+"T12:00:00");return {dow:d.toLocaleDateString("en-US",{weekday:"short"}),day:d.getDate()};};
+  const t=todayStr();
+  return(
+    <div>
+      <div style={{marginBottom:26}}><h2 style={S.h2}>History</h2><p style={S.muted}>{logs.length} total entries across {byDate.length} days</p></div>
+      <div style={{display:"flex",gap:18,alignItems:"start"}}>
+        <div style={{flex:1,minWidth:0}}>
+          {byMonth.length===0&&<div style={S.card}><p style={{...S.muted,textAlign:"center",padding:"20px 0"}}>No logs yet.</p></div>}
+          {byMonth.map(([monthKey,dates])=>(
+            <div key={monthKey} style={{marginBottom:8}}>
+              <button onClick={()=>toggleMonth(monthKey)} style={{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 16px",background:C.card,border:`1px solid ${C.border}`,borderRadius:openMonths[monthKey]?"10px 10px 0 0":10,cursor:"pointer",fontFamily:"inherit",fontWeight:700,fontSize:14}}>
+                <span>{fmtMonthKey(monthKey)}</span>
+                <div style={{display:"flex",alignItems:"center",gap:10}}><span style={S.muted}>{dates.length}d</span><span style={{color:C.muted,fontSize:12}}>▼</span></div>
+              </button>
+              {openMonths[monthKey]&&<div style={{border:`1px solid ${C.border}`,borderTop:"none",borderRadius:"0 0 10px 10px",overflow:"hidden",background:C.card}}>
+                {dates.map((date,i)=>{
+                  const {dow,day}=fmtDayShort(date),dayEntries=logs.filter(l=>l.date===date),isSelected=selectedDate===date,isToday=date===t;
+                  return(
+                    <div key={date}>
+                      {i>0&&<hr style={S.divider}/>}
+                      <div onClick={()=>openDay(date)} style={{display:"flex",alignItems:"center",gap:14,padding:"11px 16px",cursor:"pointer",background:isSelected?C.faint:"transparent"}}>
+                        <div style={{width:42,textAlign:"center",flexShrink:0}}>
+                          <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:"uppercase"}}>{dow}</div>
+                          <div style={{...S.mono,fontSize:20,fontWeight:700,lineHeight:1.1,color:isToday?C.accent:C.text}}>{day}</div>
+                        </div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:4}}>{dayEntries.map(l=>{const v=variables.find(x=>x.id===l.variableId);if(!v)return null;return <div key={l.id} style={{width:8,height:8,borderRadius:"50%",background:v.color,flexShrink:0}} />;})}</div>
+                          <div style={{fontSize:12,color:C.muted,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{dayEntries.slice(0,3).map(l=>{const v=variables.find(x=>x.id===l.variableId);if(!v)return null;return `${v.name}: ${getTodayDisplay(v,l.value)}`;}).filter(Boolean).join("  ·  ")}{dayEntries.length>3?`  +${dayEntries.length-3} more`:""}</div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+                          {isToday&&<span style={S.badge(C.accent)}>Today</span>}
+                          <span style={{...S.muted,fontSize:12}}>{dayEntries.length}</span>
+                          <span style={{color:C.muted,fontSize:11}}>›</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>}
+            </div>
+          ))}
+        </div>
+        {selectedDate&&(
+          <div style={{width:300,flexShrink:0,position:"sticky",top:80}}>
+            <div style={S.card}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:18}}>
+                <div><div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{fmtDayHeader(selectedDate)}</div><div style={{...S.muted,fontSize:12}}>{dayLogs.length} entries</div></div>
+                <button onClick={()=>setSelectedDate(null)} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:C.muted,padding:0}}>×</button>
+              </div>
+              {!editing?(
+                <>
+                  {dayLogs.length===0&&<p style={S.muted}>No logs for this day.</p>}
+                  {dayLogs.map((l,i)=>{const v=variables.find(x=>x.id===l.variableId);if(!v)return null;return(<div key={l.id}>{i>0&&<hr style={S.divider}/>}<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0"}}><div style={{display:"flex",alignItems:"center",gap:9}}><div style={{width:9,height:9,borderRadius:"50%",background:v.color,flexShrink:0}}/><span style={{fontWeight:600,fontSize:14}}>{v.name}</span></div><span style={{...S.mono,fontSize:14,fontWeight:700}}>{getTodayDisplay(v,l.value)}</span></div></div>);})}
+                  <div style={{display:"flex",gap:8,marginTop:16}}><button style={{...S.btn("outline",true),flex:1}} onClick={startEdit}>Edit</button><button style={S.btn("danger",true)} onClick={deleteDay}>Delete</button></div>
+                </>
+              ):(
+                <>
+                  <p style={{...S.muted,marginBottom:14,fontSize:12}}>Editing {fmtDate(selectedDate)}:</p>
+                  {variables.map(v=><div key={v.id} style={{marginBottom:12}}><label style={S.label}>{v.name}{v.unit?` (${v.unit})`:""}</label><ValueInput variable={v} value={editValues[v.id]} onChange={val=>setEditValues(ev=>({...ev,[v.id]:val}))} /></div>)}
+                  <div style={{display:"flex",gap:8,marginTop:16}}><button style={{...S.btn("outline",true),flex:1}} onClick={()=>setEditing(false)}>Cancel</button><button style={{...S.btn(undefined,true),flex:1}} onClick={saveEdit}>Save</button></div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Goal Progress Bar ─────────────────────────────────────────────────────────
+function GoalProgressBar({variable:v,value}){
+  const pct=goalProgress(v,value),met=goalMet(v,value);
+  if(pct===null) return null;
+  const cp=Math.max(0,Math.min(1,pct));
+  return(
+    <div style={{marginTop:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+        <span style={{fontSize:10,color:C.muted,fontWeight:600}}>Goal: {v.goalDir==="min"?"≥":"≤"}{v.goal}{v.unit?" "+v.unit:""}</span>
+        <span style={{fontSize:10,fontWeight:700,color:met?"#2D6A4F":"#C53030"}}>{Math.round(cp*100)}%</span>
+      </div>
+      <div style={{height:4,background:C.faint,borderRadius:2,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${cp*100}%`,background:met?"#2D6A4F":cp>0.7?C.accent:"#C53030",borderRadius:2,transition:"width 0.4s ease"}} />
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App(){
+  const [tab,setTab]=useState("dashboard");
+  const [variables,setVariables]=useState([]);
+  const [logs,setLogs]=useState([]);
+  const [loaded,setLoaded]=useState(false);
+  const [showNewVar,setShowNewVar]=useState(false);
+  const [editingVar,setEditingVar]=useState(null);
+  const [logValues,setLogValues]=useState({});
+  const logDate=todayStr();
+  const [selVar,setSelVar]=useState(null);
+  const [toast,setToast]=useState(null);
+  const [aTab,setATab]=useState("deepdive");
+  const [dashHidden,setDashHidden]=useState({});
+  const [dashEdit,setDashEdit]=useState(false);
+  const exportRef=useRef(null);
+  const [showExport,setShowExport]=useState(false);
+  const [showImport,setShowImport]=useState(false);
+  const [importText,setImportText]=useState("");
+
+  // ── Load from localStorage ──
+  useEffect(()=>{
+    try{
+      const vr=ls.get("lt5:vars"),lr=ls.get("lt5:logs"),dhr=ls.get("lt5:dashHidden");
+      if(dhr) setDashHidden(JSON.parse(dhr.value));
+      const vars=vr?JSON.parse(vr.value):DEFAULT_VARS;
+      const loadedLogs=lr?JSON.parse(lr.value):generateDummyLogs(DEFAULT_VARS);
+      setVariables(vars);setLogs(loadedLogs);
+    }catch{setVariables(DEFAULT_VARS);setLogs(generateDummyLogs(DEFAULT_VARS));}
+    setLoaded(true);
+  },[]);
+
+  // ── Save to localStorage ──
+  useEffect(()=>{if(loaded)ls.set("lt5:vars",JSON.stringify(variables));},[variables,loaded]);
+  useEffect(()=>{if(loaded)ls.set("lt5:logs",JSON.stringify(logs));},[logs,loaded]);
+  useEffect(()=>{if(loaded)ls.set("lt5:dashHidden",JSON.stringify(dashHidden));},[dashHidden,loaded]);
+
+  function notify(msg){setToast(msg);setTimeout(()=>setToast(null),2600);}
+
+  useEffect(()=>{
+    if(tab==="log"){
+      const prefilled={};
+      variables.forEach(v=>{const existing=logs.filter(l=>l.variableId===v.id&&l.date===logDate).sort((a,b)=>b.ts-a.ts)[0];if(existing)prefilled[v.id]=existing.value;});
+      setLogValues(prefilled);
+    }
+  },[tab,variables,logs]);
+
+  function submitLog(){
+    const entries=Object.entries(logValues).filter(([,v])=>v!==""&&v!==undefined&&v!==null);
+    if(!entries.length){notify("Nothing to log");return;}
+    const ids=entries.map(([id])=>id);
+    setLogs([...logs.filter(l=>!(ids.includes(l.variableId)&&l.date===logDate)),...entries.map(([id,value])=>({id:uid(),variableId:id,value,date:logDate,ts:Date.now()}))]);
+    notify(`✓ Logged ${entries.length} item${entries.length>1?"s":""}`);
+  }
+
+  function moveVar(idx,dir){const nv=[...variables],target=idx+dir;if(target<0||target>=nv.length)return;[nv[idx],nv[target]]=[nv[target],nv[idx]];setVariables(nv);}
+
+  const t=todayStr();
+  const today=new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"});
+  const todayData=useMemo(()=>variables.map(v=>({...v,todayValue:logs.filter(l=>l.variableId===v.id&&l.date===t).sort((a,b)=>b.ts-a.ts)[0]?.value})),[variables,logs,t]);
+  const streakAtRisk=useMemo(()=>variables.filter(v=>{const s=computeStreak(logs,v.id);return s>=2&&!logs.some(l=>l.variableId===v.id&&l.date===t);}),[variables,logs,t]);
+  const todayCompletion=useMemo(()=>{if(!variables.length)return null;const logged=variables.filter(v=>logs.some(l=>l.variableId===v.id&&l.date===t)).length;return {logged,total:variables.length,pct:Math.round((logged/variables.length)*100)};},[variables,logs,t]);
+
+  const getAvg=(varId)=>{const v=variables.find(x=>x.id===varId),vals=logs.filter(l=>l.variableId===varId&&["numeric","consumption"].includes(v?.type)).map(l=>Number(l.value));return vals.length?(vals.reduce((a,b)=>a+b)/vals.length).toFixed(1):null;};
+  const getBoolRate=(varId)=>{const ls2=logs.filter(l=>l.variableId===varId);if(!ls2.length)return null;return Math.round(ls2.filter(l=>l.value===true||l.value==="true").length/ls2.length*100);};
+  const getWeeklyAvg=(varId)=>{const v=variables.find(x=>x.id===varId);if(!v||!["numeric","consumption"].includes(v.type))return null;const vals=logs.filter(l=>l.variableId===varId&&l.date>=dateOffset(-7)).map(l=>Number(l.value));return vals.length?(vals.reduce((a,b)=>a+b)/vals.length).toFixed(1):null;};
+  function getTodayDisplay(v,val){if(val===undefined||val===null)return null;if(v.type==="boolean")return val===true||val==="true"?"✓ Yes":"✗ No";if(v.type==="categorical")return val;return `${val}${v.unit?" "+v.unit:""}`;}
+
+  const correlations=useMemo(()=>{
+    const nv=variables.filter(v=>["numeric","consumption","boolean"].includes(v.type)),res=[];
+    for(let i=0;i<nv.length;i++)for(let j=i+1;j<nv.length;j++){
+      const [va,vb]=[nv[i],nv[j]];
+      const ma=new Map(logs.filter(l=>l.variableId===va.id).map(l=>[l.date,va.type==="boolean"?(l.value===true||l.value==="true"?1:0):Number(l.value)]));
+      const mb=new Map(logs.filter(l=>l.variableId===vb.id).map(l=>[l.date,vb.type==="boolean"?(l.value===true||l.value==="true"?1:0):Number(l.value)]));
+      const common=[...ma.keys()].filter(d=>mb.has(d));if(common.length<3)continue;
+      const r=pearson(common.map(d=>ma.get(d)),common.map(d=>mb.get(d)));
+      if(r!==null)res.push({a:va.name,b:vb.name,r:parseFloat(r.toFixed(2)),n:common.length,va,vb});
+    }
+    return res.sort((a,b)=>Math.abs(b.r)-Math.abs(a.r));
+  },[variables,logs]);
+
+  const exportCSV=useMemo(()=>{
+    if(!showExport||!variables.length)return"";
+    const dateMap={};
+    logs.forEach(l=>{if(!dateMap[l.date])dateMap[l.date]={};const v=variables.find(x=>x.id===l.variableId);if(!v)return;if(!dateMap[l.date][l.variableId]||l.ts>dateMap[l.date][l.variableId].ts)dateMap[l.date][l.variableId]=l;});
+    const dates=Object.keys(dateMap).sort();
+    const esc=val=>{if(val==null||val==="")return"";const s=String(val);if(s.includes(",")||s.includes('"')||s.includes("\n"))return `"${s.replace(/"/g,'""')}"`;return s;};
+    const header=["Date",...variables.map(v=>v.name+(v.unit?` (${v.unit})`:""))];
+    const rows=[header.map(esc).join(",")];
+    dates.forEach(date=>{const row=[date];variables.forEach(v=>{const entry=dateMap[date]?.[v.id];if(!entry){row.push("");return;}const val=entry.value;if(v.type==="boolean")row.push(val===true||val==="true"?"Yes":"No");else row.push(esc(val));});rows.push(row.join(","));});
+    return rows.join("\n");
+  },[showExport,variables,logs]);
+
+  function copyExport(){try{navigator.clipboard.writeText(exportCSV);}catch{}if(exportRef.current){exportRef.current.select();try{document.execCommand("copy");}catch{}}notify("✓ Copied to clipboard");}
+  function downloadExport(){try{const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(exportCSV);a.download=`holos-export-${todayStr()}.csv`;document.body.appendChild(a);a.click();document.body.removeChild(a);notify("✓ Download started");}catch{notify("Use Copy instead");}}
+
+  function processImport(jsonStr){
+    try{
+      const data=JSON.parse(jsonStr);
+      if(!data.variables||!Array.isArray(data.variables))throw new Error();
+      if(!data.logs||!Array.isArray(data.logs))throw new Error();
+      if(!window.confirm(`Import ${data.variables.length} variables and ${data.logs.length} logs? This replaces all current data.`))return;
+      setVariables(data.variables);setLogs(data.logs);if(data.dashHidden)setDashHidden(data.dashHidden);
+      setShowImport(false);setImportText("");notify(`✓ Imported ${data.variables.length} variables, ${data.logs.length} logs`);
+    }catch{notify("Invalid JSON — check format and try again");}
+  }
+  function handleFileImport(e){const file=e.target.files?.[0];if(!file)return;const reader=new FileReader();reader.onload=ev=>processImport(ev.target.result);reader.readAsText(file);e.target.value="";}
+
+  const ANALYTICS_TABS=[["deepdive","Deep Dive"],["correlations","Correlations"],["conditional","Conditional"],["heatmap","Heatmap"],["rolling","Rolling Avg"]];
+
+  if(!loaded)return<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:C.muted,fontFamily:"Georgia,serif"}}><div style={{textAlign:"center"}}><div style={{width:7,height:7,borderRadius:"50%",background:C.accent,margin:"0 auto 12px"}}/>Loading…</div></div>;
+
+  return(
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;700&display=swap');
+        *{box-sizing:border-box;}body{margin:0;}
+        input:focus,select:focus{outline:2px solid #111110;outline-offset:-1px;}
+        button:hover{opacity:0.85;}button:active{transform:scale(0.97);}
+        ::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrollbar-thumb{background:#ddd;border-radius:3px;}
+        @keyframes slideInToast{from{opacity:0;transform:translateX(-50%) translateY(12px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+      `}</style>
+      <div style={S.app}>
+
+        {/* ── Nav ── */}
+        <nav style={S.nav}>
+          <div style={{display:"flex",alignItems:"center",gap:9,flexShrink:0}}>
+            <div style={{width:7,height:7,borderRadius:"50%",background:C.accent}}/>
+            <span style={S.navTitle}>Holos</span>
+          </div>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap",justifyContent:"flex-end"}}>
+            {[["dashboard","Dashboard"],["log","Log"],["analytics","Analytics"],["report","Report Card"],["history","History"],["variables","Variables"]].map(([tb,label])=>(
+              <button key={tb} style={S.tab(tab===tb)} onClick={()=>setTab(tb)}>{label}</button>
+            ))}
+          </div>
+        </nav>
+
+        <main style={S.main}>
+
+          {/* ══ DASHBOARD ══ */}
+          {tab==="dashboard"&&<>
+            <div style={{marginBottom:20}}><p style={{...S.muted,marginBottom:3,fontStyle:"italic"}}>{today}</p><h2 style={S.h2}>Dashboard</h2></div>
+            {todayCompletion&&todayCompletion.total>0&&(
+              <div style={{...S.card,display:"flex",alignItems:"center",gap:16,marginBottom:16,padding:"14px 20px"}}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                    <span style={{fontWeight:700,fontSize:13}}>Today's Progress</span>
+                    <span style={{...S.mono,fontSize:13,fontWeight:700,color:todayCompletion.pct===100?"#2D6A4F":C.text}}>{todayCompletion.logged}/{todayCompletion.total}</span>
+                  </div>
+                  <div style={{height:6,background:C.faint,borderRadius:3,overflow:"hidden"}}>
+                    <div style={{height:"100%",width:`${todayCompletion.pct}%`,background:todayCompletion.pct===100?"#2D6A4F":C.accent,borderRadius:3,transition:"width 0.5s ease"}}/>
+                  </div>
+                </div>
+                {todayCompletion.pct<100&&<button style={S.btn("accent",true)} onClick={()=>setTab("log")}>Log Now</button>}
+                {todayCompletion.pct===100&&<span style={{fontSize:18}}>✨</span>}
+              </div>
+            )}
+            {streakAtRisk.map(v=>{const streak=computeStreak(logs,v.id);return(
+              <div key={v.id} style={{background:"#FFFBEB",border:"1px solid #FCD34D",borderLeft:"3px solid #F59E0B",borderRadius:10,padding:"11px 16px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:9,flex:1,minWidth:0}}>
+                  <span>⚠️</span>
+                  <div><span style={{fontWeight:700,fontSize:14}}>Streak at Risk — {v.name}</span><span style={{color:"#92400E",fontSize:13,marginLeft:8}}>Your {streak}-day streak breaks without logging today.</span></div>
+                </div>
+                <button style={{...S.btn("primary",true),background:"#D97706"}} onClick={()=>setTab("log")}>Log →</button>
+              </div>
+            );})}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <h3 style={{...S.h3,margin:0}}>Today's Status</h3>
+              <button onClick={()=>setDashEdit(e=>!e)} style={{padding:"5px 14px",borderRadius:6,border:`1px solid ${C.border}`,background:dashEdit?C.text:"transparent",color:dashEdit?C.bg:C.muted,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:600}}>{dashEdit?"Done":"Edit Tiles"}</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:12,marginBottom:28}}>
+              {todayData.filter(v=>dashEdit||!dashHidden[v.id]).map(v=>{
+                const wkAvg=getWeeklyAvg(v.id),allAvg=getAvg(v.id);
+                const arrow=wkAvg&&allAvg?trendArrow(parseFloat(wkAvg),parseFloat(allAvg)):{symbol:"→",color:C.muted};
+                const hidden=dashHidden[v.id],met=goalMet(v,v.todayValue);
+                return(
+                  <div key={v.id} style={{...S.lcard(v.color),opacity:hidden?0.4:1,position:"relative"}}>
+                    {dashEdit&&<button onClick={()=>setDashHidden(h=>({...h,[v.id]:!h[v.id]}))} style={{position:"absolute",top:10,right:10,background:hidden?"#2D6A4F":"#C53030",border:"none",borderRadius:4,color:"#fff",fontSize:11,fontWeight:700,cursor:"pointer",padding:"2px 8px",fontFamily:"inherit"}}>{hidden?"Show":"Hide"}</button>}
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{fontSize:12,fontWeight:700,color:C.muted}}>{v.name.toUpperCase()}</span>
+                        {met!==null&&<div style={{width:8,height:8,borderRadius:"50%",background:met?"#2D6A4F":"#C53030"}}/>}
+                      </div>
+                    </div>
+                    <div style={{display:"flex",alignItems:"baseline",gap:7,marginBottom:4}}>
+                      <div style={{...S.mono,fontSize:22,fontWeight:700,color:v.todayValue!=null?C.text:"#CCC"}}>{v.todayValue!=null?getTodayDisplay(v,v.todayValue):"—"}</div>
+                      {!dashEdit&&<span style={{fontSize:16,color:arrow.color,fontWeight:700}}>{arrow.symbol}</span>}
+                    </div>
+                    {!dashEdit&&v.todayValue!=null&&["numeric","consumption"].includes(v.type)&&v.goal!=null&&<GoalProgressBar variable={v} value={v.todayValue}/>}
+                    {!dashEdit&&<div style={{display:"flex",gap:12,flexWrap:"wrap",marginTop:6}}>
+                      <span style={{...S.muted,fontSize:12}}>🔥 {computeStreak(logs,v.id)}d</span>
+                      {allAvg&&<span style={{...S.muted,fontSize:12}}>avg {allAvg}{v.unit?" "+v.unit:""}</span>}
+                      {getBoolRate(v.id)!==null&&v.type==="boolean"&&<span style={{...S.muted,fontSize:12}}>{getBoolRate(v.id)}%</span>}
+                    </div>}
+                  </div>
+                );
+              })}
+              {todayData.length===0&&<div style={{...S.card,gridColumn:"1/-1",textAlign:"center",padding:"32px 16px"}}><p style={S.muted}>No variables yet.</p><button style={S.btn()} onClick={()=>{setTab("variables");setShowNewVar(true);}}>+ New Variable</button></div>}
+            </div>
+            <h3 style={S.h3}>Recent Activity</h3>
+            <div style={S.card}>
+              {logs.length===0&&<p style={{...S.muted,textAlign:"center",padding:"20px 0"}}>No logs yet. Start logging!</p>}
+              {[...logs].sort((a,b)=>b.ts-a.ts).slice(0,15).map((l,i)=>{
+                const v=variables.find(x=>x.id===l.variableId);if(!v)return null;
+                return(<div key={l.id}>{i>0&&<hr style={S.divider}/>}<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0"}}><div style={{display:"flex",alignItems:"center",gap:9}}><div style={{width:7,height:7,borderRadius:"50%",background:v.color,flexShrink:0}}/><span style={{fontWeight:700,fontSize:14}}>{v.name}</span><span style={S.muted}>{getTodayDisplay(v,l.value)}</span></div><span style={{...S.muted,fontSize:12}}>{fmtDate(l.date)}</span></div></div>);
+              })}
+            </div>
+          </>}
+
+          {/* ══ LOG ══ */}
+          {tab==="log"&&<>
+            <div style={{marginBottom:22}}><h2 style={S.h2}>Log Today</h2><p style={S.muted}>{today}</p></div>
+            {variables.length===0&&<div style={S.card}><p style={{...S.muted,textAlign:"center",padding:"20px 0"}}>Create some variables first.</p><div style={{textAlign:"center"}}><button style={S.btn()} onClick={()=>setTab("variables")}>Create Variables</button></div></div>}
+            {variables.map(v=>{
+              const loggedForDate=logs.some(l=>l.variableId===v.id&&l.date===logDate);
+              return(
+                <div key={v.id} style={S.lcard(v.color)}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:11,flexWrap:"wrap",gap:6}}>
+                    <div><span style={{fontWeight:700,fontSize:15}}>{v.name}</span>{v.desc&&<span style={{...S.muted,fontSize:13,marginLeft:8}}>{v.desc}</span>}</div>
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      {v.goal!=null&&<span style={{...S.muted,fontSize:11}}>🎯 {v.type==="boolean"?v.goal:v.type==="categorical"?"≥"+v.goal:(v.goalDir==="min"?"≥":"≤")+v.goal+(v.unit?" "+v.unit:"")}</span>}
+                      {loggedForDate&&logValues[v.id]!==undefined&&logValues[v.id]!==null&&<span style={S.badge(v.color)}>✓ Will update</span>}
+                      {loggedForDate&&(logValues[v.id]===undefined||logValues[v.id]===null)&&<span style={S.badge(v.color)}>✓ Logged</span>}
+                    </div>
+                  </div>
+                  <ValueInput variable={v} value={logValues[v.id]??null} onChange={val=>setLogValues(p=>({...p,[v.id]:val}))} />
+                </div>
+              );
+            })}
+            {variables.length>0&&<button style={{...S.btn(),width:"100%",marginTop:4,padding:"14px",fontSize:15}} onClick={submitLog}>Save Log Entry</button>}
+          </>}
+
+          {/* ══ ANALYTICS ══ */}
+          {tab==="analytics"&&<>
+            <div style={{marginBottom:22}}><h2 style={S.h2}>Analytics</h2><p style={S.muted}>Five lenses on your data</p></div>
+            <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:26,borderBottom:`1px solid ${C.border}`,paddingBottom:12}}>
+              {ANALYTICS_TABS.map(([k,label])=><button key={k} style={{...S.tab(aTab===k),fontSize:12,padding:"6px 14px"}} onClick={()=>setATab(k)}>{label}</button>)}
+            </div>
+            {aTab==="deepdive"&&<>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:18}}>
+                {variables.map(v=><button key={v.id} onClick={()=>setSelVar(selVar===v.id?null:v.id)} style={{padding:"7px 18px",borderRadius:20,border:`1.5px solid ${selVar===v.id?v.color:C.border}`,background:selVar===v.id?v.color+"15":C.card,cursor:"pointer",fontSize:13,fontWeight:selVar===v.id?700:400,color:selVar===v.id?v.color:C.muted,fontFamily:"inherit"}}>{v.name}</button>)}
+              </div>
+              {selVar&&(()=>{
+                const v=variables.find(x=>x.id===selVar);if(!v)return null;
+                const streak=computeStreak(logs,selVar),avg=getAvg(selVar),wkAvg=getWeeklyAvg(selVar);
+                const allVals=logs.filter(l=>l.variableId===selVar&&["numeric","consumption"].includes(v.type)).map(l=>Number(l.value));
+                const boolRate=getBoolRate(selVar),maxVal=allVals.length?Math.max(...allVals):null;
+                const arrow=trendArrow(wkAvg?parseFloat(wkAvg):null,avg?parseFloat(avg):null);
+                return<>
+                  <div style={S.grid(4)}>
+                    {[["Total Logs",logs.filter(l=>l.variableId===selVar).length],["Current Streak",streak+"d"],avg?["All-time Avg",avg+" "+v.unit]:boolRate!==null?["Success Rate",boolRate+"%"]:null,wkAvg?["7-day Avg",[wkAvg+" "+v.unit,arrow.symbol,arrow.color]]:maxVal!==null?["All-time High",maxVal+" "+v.unit]:null].filter(Boolean).map(([label,val])=>(
+                      <div key={label} style={S.card}><div style={{...S.muted,fontSize:11,marginBottom:5}}>{label}</div>{Array.isArray(val)?<div style={{...S.mono,fontSize:18,fontWeight:700}}>{val[0]} <span style={{color:val[2]}}>{val[1]}</span></div>:<div style={{...S.mono,fontSize:20,fontWeight:700}}>{val}</div>}</div>
+                    ))}
+                  </div>
+                  <div style={S.card}><div style={{fontWeight:700,fontSize:15,marginBottom:16}}>{v.name} — 90-day Trend</div><RollingChart variable={v} logs={logs}/></div>
+                </>;
+              })()}
+              {!selVar&&<div style={{...S.card,textAlign:"center",padding:"32px 16px",color:C.muted}}>Select a variable above to see its analytics.</div>}
+            </>}
+            {aTab==="correlations"&&<>
+              <div style={S.card}>
+                {correlations.length===0?<p style={{...S.muted,textAlign:"center",padding:"20px 0"}}>Need ≥3 overlapping days of two numeric/boolean variables.</p>:correlations.map((c,i)=>{
+                  let insight=null;
+                  if(Math.abs(c.r)>=0.35){const direction=c.r>0?"positively":"inversely",strength=Math.abs(c.r)>0.7?"strongly":Math.abs(c.r)>0.4?"moderately":"mildly";insight=`${c.a} and ${c.b} are ${strength} ${direction} correlated.`;}
+                  return(<div key={i}>{i>0&&<hr style={S.divider}/>}<div style={{padding:"12px 0"}}><div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}><span style={{fontWeight:700}}>{c.a}</span><span style={{color:C.muted}}>↔</span><span style={{fontWeight:700}}>{c.b}</span></div><span style={{...S.muted,fontSize:12}}>{c.n} shared days</span></div><div style={{display:"flex",alignItems:"center",gap:10}}><div style={{width:80,height:6,background:C.faint,borderRadius:3,overflow:"hidden"}}><div style={{width:`${Math.abs(c.r)*100}%`,height:"100%",background:c.r>0?"#2D6A4F":"#C53030",borderRadius:3}}/></div><span style={{...S.mono,fontSize:14,fontWeight:700,minWidth:42}}>{c.r>0?"+":""}{c.r}</span><span style={S.badge(Math.abs(c.r)>0.6?(c.r>0?"#2D6A4F":"#C53030"):"#888885")}>{Math.abs(c.r)>0.7?"Strong":Math.abs(c.r)>0.4?"Moderate":"Weak"} {c.r>0?"↑":"↓"}</span></div></div>{insight&&<div style={{marginTop:8,padding:"7px 12px",background:C.faint,borderRadius:7,fontSize:12,fontStyle:"italic"}}>💡 {insight}</div>}</div></div>);
+                })}
+              </div>
+            </>}
+            {aTab==="conditional"&&<>
+              <p style={{...S.muted,marginBottom:16,lineHeight:1.6}}>Split any variable by a threshold and compare how an outcome metric differs between the two groups.</p>
+              <ConditionalCorrelation variables={variables} logs={logs}/>
+            </>}
+            {aTab==="heatmap"&&<>
+              <p style={{...S.muted,marginBottom:20,lineHeight:1.6}}>6-month calendar. Hover a cell to see the exact value.</p>
+              {variables.map(v=>(
+                <div key={v.id} style={S.card}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><div style={{display:"flex",alignItems:"center",gap:9}}><div style={{width:9,height:9,borderRadius:"50%",background:v.color}}/><span style={{fontWeight:700,fontSize:15}}>{v.name}</span></div><span style={S.badge(v.color)}>{logs.filter(l=>l.variableId===v.id).length} logs</span></div><HeatmapCalendar variable={v} logs={logs}/></div>
+              ))}
+            </>}
+            {aTab==="rolling"&&<>
+              <p style={{...S.muted,marginBottom:20,lineHeight:1.6}}>Toggle between 7-day and 30-day rolling windows.</p>
+              {variables.filter(v=>["numeric","consumption"].includes(v.type)).length===0?<div style={{...S.card,textAlign:"center",padding:"32px 16px",color:C.muted}}>Create numeric variables to see rolling charts.</div>:variables.filter(v=>["numeric","consumption"].includes(v.type)).map(v=>(
+                <div key={v.id} style={S.card}><div style={{display:"flex",alignItems:"center",gap:9,marginBottom:14}}><div style={{width:9,height:9,borderRadius:"50%",background:v.color}}/><span style={{fontWeight:700,fontSize:15}}>{v.name}</span>{v.unit&&<span style={S.muted}>({v.unit})</span>}</div><RollingChart variable={v} logs={logs}/></div>
+              ))}
+            </>}
+          </>}
+
+          {/* ══ REPORT CARD ══ */}
+          {tab==="report"&&<>
+            <div style={{marginBottom:26}}><h2 style={S.h2}>Weekly Report Card</h2><p style={S.muted}>Graded on consistency + performance vs. your 4-week baseline</p></div>
+            {variables.length===0?<div style={{...S.card,textAlign:"center",padding:"32px 16px"}}><p style={S.muted}>Create variables first.</p><button style={S.btn()} onClick={()=>setTab("variables")}>Create Variables</button></div>:<div style={S.card}><WeeklyReportCard variables={variables} logs={logs}/></div>}
+            <div style={{...S.card,background:C.faint}}>
+              <h3 style={S.h3}>How Grades Work</h3>
+              <p style={{...S.muted,lineHeight:1.65,marginBottom:14}}>Graded on logging consistency and how your values compare to your personal 4-week rolling average — calibrated to <em>your</em> baseline.</p>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{[["A+/A","≥80%","#2D6A4F"],["B","70–79%","#276749"],["C","60–69%","#B7791F"],["D","40–59%","#D4622A"],["F","<40%","#C53030"]].map(([grade,range,color])=><div key={grade} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 12px",background:color+"12",borderRadius:8}}><span style={{...S.mono,fontWeight:700,color,fontSize:14}}>{grade}</span><span style={{...S.muted,fontSize:12}}>{range}</span></div>)}</div>
+            </div>
+          </>}
+
+          {/* ══ HISTORY ══ */}
+          {tab==="history"&&<HistoryTab variables={variables} logs={logs} setLogs={setLogs} notify={notify} getTodayDisplay={getTodayDisplay}/>}
+
+          {/* ══ VARIABLES ══ */}
+          {tab==="variables"&&<>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22,flexWrap:"wrap",gap:12}}>
+              <div><h2 style={S.h2}>Variables</h2><p style={S.muted}>{variables.length} variable{variables.length!==1?"s":""} configured</p></div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <button style={S.btn("outline")} onClick={()=>setShowExport(true)}>↓ Export</button>
+                <button style={S.btn("outline")} onClick={()=>setShowImport(true)}>↑ Import</button>
+                <button style={S.btn()} onClick={()=>setShowNewVar(true)}>+ New Variable</button>
+              </div>
+            </div>
+            {variables.length===0&&<div style={{...S.card,textAlign:"center",padding:"32px 16px"}}><p style={S.muted}>No variables yet.</p><button style={S.btn()} onClick={()=>setShowNewVar(true)}>+ Create Your First Variable</button></div>}
+            {variables.map((v,idx)=>{
+              const count=logs.filter(l=>l.variableId===v.id).length;
+              return(
+                <div key={v.id} style={{...S.lcard(v.color),display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                  <div style={{display:"flex",flexDirection:"column",gap:2,flexShrink:0}}>
+                    <button onClick={()=>moveVar(idx,-1)} disabled={idx===0} style={{background:"none",border:"none",cursor:idx===0?"default":"pointer",fontSize:12,color:idx===0?C.border:C.muted,padding:0,lineHeight:1}}>▲</button>
+                    <button onClick={()=>moveVar(idx,1)} disabled={idx===variables.length-1} style={{background:"none",border:"none",cursor:idx===variables.length-1?"default":"pointer",fontSize:12,color:idx===variables.length-1?C.border:C.muted,padding:0,lineHeight:1}}>▼</button>
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:700,fontSize:15}}>{v.name}{v.unit&&<span style={{...S.muted,fontWeight:400,fontSize:13}}> ({v.unit})</span>}</div>
+                    {v.desc&&<div style={{...S.muted,fontSize:12,marginTop:2}}>{v.desc}</div>}
+                    {v.type==="categorical"&&v.options?.length>0&&<div style={{...S.muted,fontSize:12,marginTop:2}}>{v.options.join(" · ")}</div>}
+                    <div style={{display:"flex",gap:12,marginTop:3,flexWrap:"wrap"}}>
+                      <span style={{...S.muted,fontSize:11}}>{count} log{count!==1?"s":""}</span>
+                      {v.goal!=null&&<span style={{fontSize:11,color:"#2D6A4F",fontWeight:600}}>🎯 Goal: {v.type==="boolean"?v.goal:(v.goalDir==="min"?"≥":"≤")+v.goal+(v.unit?" "+v.unit:"")}</span>}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0,flexWrap:"wrap"}}>
+                    <span style={S.badge(v.color)}>{TYPE_LABELS[v.type]}</span>
+                    <button style={S.btn("outline",true)} onClick={()=>setEditingVar(v)}>Edit</button>
+                    <button style={S.btn("danger",true)} onClick={()=>{if(window.confirm(`Delete "${v.name}"? This will also remove all its logs.`)){setVariables(vs=>vs.filter(x=>x.id!==v.id));setLogs(ls=>ls.filter(l=>l.variableId!==v.id));notify(`Deleted ${v.name}`);}}}>Delete</button>
+                  </div>
+                </div>
+              );
+            })}
+          </>}
+
+        </main>
+
+        {/* Toast */}
+        {toast&&<div style={{position:"fixed",bottom:20,left:"50%",transform:"translateX(-50%)",background:C.text,color:C.bg,padding:"11px 22px",borderRadius:8,fontSize:14,fontWeight:600,zIndex:2000,fontFamily:"inherit",boxShadow:"0 4px 20px rgba(0,0,0,0.2)",whiteSpace:"nowrap",animation:"slideInToast 0.2s ease"}}>{toast}</div>}
+
+        {showNewVar&&<Modal title="New Variable" onClose={()=>setShowNewVar(false)}><VarForm onSave={v=>{setVariables(vs=>[...vs,v]);notify(`Created "${v.name}"`);}} onClose={()=>setShowNewVar(false)}/></Modal>}
+        {editingVar&&<Modal title={`Edit: ${editingVar.name}`} onClose={()=>setEditingVar(null)}><VarForm initial={editingVar} isEdit onSave={updated=>{setVariables(vs=>vs.map(v=>v.id===updated.id?{...v,...updated}:v));notify(`Updated "${updated.name}"`);}} onClose={()=>setEditingVar(null)}/></Modal>}
+
+        {showExport&&<Modal title="Export Data — CSV" onClose={()=>setShowExport(false)} width={580}>
+          <p style={{...S.muted,lineHeight:1.6,marginTop:0,marginBottom:14}}>Spreadsheet-ready CSV. Open in Excel, Google Sheets, or any data tool.</p>
+          <div style={{display:"flex",gap:8,marginBottom:14}}><button style={{...S.btn(),flex:1}} onClick={copyExport}>📋 Copy to Clipboard</button><button style={{...S.btn("outline"),flex:1}} onClick={downloadExport}>↓ Download .csv</button></div>
+          <textarea ref={exportRef} readOnly value={exportCSV} style={{...S.input,...S.mono,fontSize:11,height:200,resize:"vertical",lineHeight:1.5,background:C.faint,padding:14}} />
+        </Modal>}
+
+        {showImport&&<Modal title="Import Data" onClose={()=>{setShowImport(false);setImportText("");}}>
+          <p style={{...S.muted,lineHeight:1.6,marginTop:0,marginBottom:14}}>Import a Holos JSON export. <strong style={{color:C.text}}>Replaces all current data.</strong></p>
+          <div style={{marginBottom:14}}><label style={S.label}>Upload a .json file</label><label style={{display:"flex",alignItems:"center",justifyContent:"center",padding:"18px",border:`2px dashed ${C.border}`,borderRadius:10,cursor:"pointer",background:C.faint,fontSize:13,color:C.muted,fontFamily:"inherit"}}>📁 Click to select a file…<input type="file" accept=".json" onChange={handleFileImport} style={{display:"none"}} /></label></div>
+          <div><label style={S.label}>Or paste JSON</label><textarea placeholder='{"variables":[...],"logs":[...]}' value={importText} onChange={e=>setImportText(e.target.value)} style={{...S.input,...S.mono,fontSize:11,height:120,resize:"vertical",lineHeight:1.5,background:C.faint,padding:14}} /></div>
+          <div style={{display:"flex",gap:8,marginTop:12,justifyContent:"flex-end"}}><button style={S.btn("outline")} onClick={()=>{setShowImport(false);setImportText("");}}>Cancel</button><button style={S.btn()} onClick={()=>{if(!importText.trim()){notify("Paste some JSON first");return;}processImport(importText.trim());}}>Import Data</button></div>
+        </Modal>}
+
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
 </html>
